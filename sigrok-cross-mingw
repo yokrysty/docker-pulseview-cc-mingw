@@ -1,0 +1,292 @@
+#!/bin/sh
+##
+## This file is part of the sigrok-util project.
+##
+## Copyright (C) 2013-2020 Uwe Hermann <uwe@hermann-uwe.de>
+##
+## This program is free software; you can redistribute it and/or modify
+## it under the terms of the GNU General Public License as published by
+## the Free Software Foundation; either version 2 of the License, or
+## (at your option) any later version.
+##
+## This program is distributed in the hope that it will be useful,
+## but WITHOUT ANY WARRANTY; without even the implied warranty of
+## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+## GNU General Public License for more details.
+##
+## You should have received a copy of the GNU General Public License
+## along with this program; if not, see <http://www.gnu.org/licenses/>.
+##
+
+# https://www.diffchecker.com/kz7JKTlI/
+
+set -e
+#set -x
+
+# Build target: "i686" (32bit) or "x86_64" (64bit).
+TARGET="x86_64"
+
+SELF_DIR=$(dirname "$(realpath $0)")
+
+# The path where your MXE directory is located.
+MXE=$HOME/mxe-git
+
+# The base path prefix where the cross-compiled packages will be installed.
+PREFIXBASE=$HOME/sr_mingw
+
+# The base path prefix where to download files to and where to build packages.
+BUILDBASE=./build
+
+# Edit this to control verbose build output.
+#V="V=1 VERBOSE=1"
+
+# Edit this to enable/disable/modify parallel compiles.
+PARALLEL="-j4"
+
+# Edit this to enable/disable debug builds.
+DEBUG=0
+
+# Optionally show some progress as the script executes.
+# ECHO=true
+ECHO=echo
+
+# You usually don't need to change anything below this line.
+
+# -----------------------------------------------------------------------------
+
+$ECHO "setting up fetch variables ..."
+
+WGET="wget -c --quiet"
+GIT_CLONE="git clone --depth=1"
+
+REPO_BASE="git://sigrok.org"
+
+# Construct the build and install directory pathnames.
+if [ $TARGET = "i686" ]; then
+	SUFFIX="32"
+else
+	SUFFIX="64"
+fi
+if [ $DEBUG = 1 ]; then
+	# CFLAGS/CXXFLAGS contains "-g" per default for autotools projects.
+	BUILD_TYPE="Debug"
+	PREFIX=$PREFIXBASE"_debug_"$SUFFIX
+	BUILDDIR=$BUILDBASE"_debug_"$SUFFIX
+else
+	BUILD_TYPE="Release"
+	PREFIX=$PREFIXBASE"_release_"$SUFFIX
+	BUILDDIR=$BUILDBASE"_release_"$SUFFIX
+fi
+
+# -----------------------------------------------------------------------------
+
+$ECHO "setting up toolchain variables ..."
+
+# We need to find tools in the toolchain.
+export PATH=$MXE/usr/bin:$PATH
+
+TOOLCHAIN_TRIPLET="$TARGET-w64-mingw32.static.posix"
+
+CMAKE="$TOOLCHAIN_TRIPLET-cmake"
+
+P="$PREFIX/lib/pkgconfig"
+P2="$MXE/usr/$TOOLCHAIN_TRIPLET/lib/pkgconfig"
+C="--host=$TOOLCHAIN_TRIPLET --prefix=$PREFIX CPPFLAGS=-D__printf__=__gnu_printf__"
+L="--disable-shared --enable-static"
+
+if [ $TARGET = "i686" ]; then
+	export PKG_CONFIG_PATH_i686_w64_mingw32_static_posix="$P:$P2"
+else
+	export PKG_CONFIG_PATH_x86_64_w64_mingw32_static_posix="$P:$P2"
+fi
+
+# Remove build directory contents (if any) and create a new build dir.
+$ECHO "starting new build directory: $BUILDDIR"
+rm -rf $BUILDDIR
+mkdir $BUILDDIR
+cd $BUILDDIR
+
+# -----------------------------------------------------------------------------
+
+mkdir -p $PREFIX
+
+$ECHO "preparing Python dependency ..."
+
+# This is a HACK which temporarily unbreaks Windows CI builds.
+# TODO Remove this line as well as $WGET_SR references below
+# when the Python34 download works again.
+WGET_SR="$WGET --no-check-certificate"
+
+# Cross-compiling Python is highly non-trivial, so we avoid it for now.
+# The download below is a repackaged tarball of the official Python 3.4.4 MSI
+# installer for Windows:
+#   - https://www.python.org/ftp/python/3.4.4/python-3.4.4.msi
+#   - https://www.python.org/ftp/python/3.4.4/python-3.4.4.amd64.msi
+# The MSI file has been installed on a Windows box and then c:\Python34\libs
+# and c:\Python34\include have been stored in the Python34_*.tar.gz tarball.
+$WGET_SR http://www.sigrok.org/tmp/Python34_$TARGET.tar.gz -O $PREFIX/Python34.tar.gz
+tar xzf $PREFIX/Python34.tar.gz -C $PREFIX
+
+# Fix for bug #1195.
+if [ $TARGET = "x86_64" ]; then
+	patch -p1 $PREFIX/Python34/include/pyconfig.h < $SELF_DIR/pyconfig.patch
+fi
+
+# Create a dummy python3.pc file so that pkg-config finds Python 3.
+mkdir -p $PREFIX/lib/pkgconfig
+cat >$PREFIX/lib/pkgconfig/python3.pc <<EOF 
+prefix=$PREFIX
+exec_prefix=\${prefix}
+libdir=\${exec_prefix}/lib
+includedir=\${prefix}/include
+Name: Python
+Description: Python library
+Version: 3.4
+Libs: $PREFIX/Python34/libs/libpython34.a
+Cflags: -I$PREFIX/Python34/include
+EOF
+
+# The python34.dll and python34.zip files will be shipped in the NSIS
+# Windows installers (required for protocol decoding to work).
+# The file python34.dll (NOT the same as python3.dll) is copied from an
+# installed Python 3.4.4 (see above) from c:\Windows\system32\python34.dll.
+# The file python34.zip contains all files from the 'DLLs', 'Lib', and 'libs'
+# subdirectories from an installed Python on Windows (c:\python34), i.e. some
+# libraries and all Python stdlib modules.
+$WGET_SR http://www.sigrok.org/tmp/python34_$TARGET.dll -O $PREFIX/python34.dll
+$WGET_SR http://www.sigrok.org/tmp/python34_$TARGET.zip -O $PREFIX/python34.zip
+
+# In order to link against Python we need libpython34.a.
+# The upstream Python 32bit installer ships this, the x86_64 installer
+# doesn't. Thus, we generate the file manually here.
+if [ $TARGET = "x86_64" ]; then
+	cp $PREFIX/python34.dll .
+	$MXE/usr/$TARGET-w64-mingw32.static.posix/bin/gendef python34.dll
+	$MXE/usr/bin/$TARGET-w64-mingw32.static.posix-dlltool \
+		--dllname python34.dll --def python34.def \
+		--output-lib libpython34.a
+	mv -f libpython34.a $PREFIX/Python34/libs
+	rm -f python34.dll
+fi
+
+# We need to include the *.pyd files from python34.zip into the installers,
+# otherwise importing certain modules (e.g. ctypes) won't work (bug #1409).
+unzip -q -o $PREFIX/python34.zip *.pyd -d $PREFIX
+
+# Zadig (we ship this with frontends for easy driver switching).
+$ECHO "fetching zadig ..."
+$WGET https://github.com/pbatard/libwdi/releases/download/v1.5.1/zadig-2.9.exe -O $PREFIX/zadig.exe
+$WGET https://github.com/pbatard/libwdi/releases/download/v1.2.5/zadig_xp-2.2.exe -O $PREFIX/zadig_xp.exe
+
+# libserialport
+$ECHO "component libserialport ..."
+$GIT_CLONE $REPO_BASE/libserialport
+cd libserialport
+./autogen.sh
+./configure $C $L
+make $PARALLEL $V
+make install $V
+cd ..
+
+# libsigrok
+$ECHO "component libsigrok ..."
+$GIT_CLONE $REPO_BASE/libsigrok
+cd libsigrok
+git reset --hard b503d24cdf56abf8c0d66d438ccac28969f01670
+patch -p1 < $SELF_DIR/libsigrok-pr-148-add-cypress-fx3.patch
+patch -p1 < $SELF_DIR/libsigrok-pr-242-run-USB-as-an-idle-task.patch
+./autogen.sh
+./configure $C $L
+make $PARALLEL $V
+make install $V
+cd ..
+
+# libsigrokdecode
+$ECHO "component libsigrokdecode ..."
+$GIT_CLONE $REPO_BASE/libsigrokdecode
+cd libsigrokdecode
+./autogen.sh
+./configure $C $L
+make $PARALLEL $V
+make install $V
+cd ..
+
+# sigrok-firmware
+$ECHO "component sigrok-firmware ..."
+$GIT_CLONE $REPO_BASE/sigrok-firmware
+cd sigrok-firmware
+./autogen.sh
+# Nothing gets cross-compiled here, we just need 'make install' basically.
+./configure --prefix=$PREFIX
+make install $V
+cd ..
+
+# sigrok-firmware-fx2lafw
+$ECHO "component sigrok-firmware-fx2lafw ..."
+$GIT_CLONE $REPO_BASE/sigrok-firmware-fx2lafw
+cd sigrok-firmware-fx2lafw
+./autogen.sh
+# We're building the fx2lafw firmware on the host, no need to cross-compile.
+./configure --prefix=$PREFIX
+make $PARALLEL $V
+make install $V
+cd ..
+
+# sigrok-firmware-fx3
+[ -f "/host/cypress-fx3.fw" ] && cp -r /host/cypress-fx3.fw $PREFIX/share/sigrok-firmware
+
+# sigrok-dumps
+$ECHO "component sigrok-dumps ..."
+$GIT_CLONE $REPO_BASE/sigrok-dumps
+cd sigrok-dumps
+make install PREFIX=$PREFIX $V
+cd ..
+
+# sigrok-cli
+$ECHO "component sigrok-cli ..."
+$GIT_CLONE $REPO_BASE/sigrok-cli
+cd sigrok-cli
+./autogen.sh
+./configure $C
+make $PARALLEL $V
+make install $V
+if [ $TARGET = "i686" ]; then
+	makensis contrib/sigrok-cli_cross.nsi
+else
+	makensis -DPE64=1 contrib/sigrok-cli_cross.nsi
+fi
+cd ..
+
+# PulseView
+$ECHO "component pulseview ..."
+$GIT_CLONE $REPO_BASE/pulseview
+cd pulseview
+patch -p1 < $SELF_DIR/pulseview-boost-numeric-literals.patch
+patch -p1 < $SELF_DIR/pulseview-manual-pdf-hack.patch
+cp $SELF_DIR/FileAssociation.nsh contrib
+$CMAKE \
+	-DCMAKE_INSTALL_PREFIX:PATH=$PREFIX \
+	-DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+	-DDISABLE_WERROR=y \
+	-DENABLE_TESTS=n \
+	.
+make $PARALLEL $V
+#make manual
+if [ $DEBUG = 1 ]; then
+	make install $V
+else
+	make install/strip $V
+fi
+
+$ECHO "creating NSIS installer ..."
+if [ $TARGET = "i686" ]; then
+	makensis contrib/pulseview_cross.nsi
+else
+	makensis -DPE64=1 contrib/pulseview_cross.nsi
+fi
+
+[ -d "/host" ] && cp -r contrib/pulseview-*-installer.exe /host/
+
+cd ..
+
+$ECHO "cross compile script done."
