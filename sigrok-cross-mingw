@@ -190,7 +190,7 @@ cd ..
 
 # libsigrok
 $ECHO "component libsigrok ..."
-$GIT_CLONE $REPO_BASE/libsigrok
+git clone $REPO_BASE/libsigrok
 cd libsigrok
 git reset --hard b503d24cdf56abf8c0d66d438ccac28969f01670
 patch -p1 < $SELF_DIR/libsigrok-pr-148-add-cypress-fx3.patch
